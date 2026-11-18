@@ -314,17 +314,14 @@ static void tg3__error_push(tg3_error_stack *es, tg3_severity sev,
     if (sev == TG3_SEVERITY_ERROR) es->has_error = 1;
 }
 
-static void tg3__error_pushf(tg3_error_stack *es, tg3_arena *arena,
-                             tg3_severity sev, tg3_error_code code,
-                             const char *json_path, const char *fmt, ...) {
+static void tg3__error_pushvf(tg3_error_stack *es, tg3_arena *arena,
+                              tg3_severity sev, tg3_error_code code,
+                              const char *json_path, const char *fmt, va_list ap) {
     char buf[1024];
     int n;
-    va_list ap;
     const char *msg = buf;
     if (!es) return;
-    va_start(ap, fmt);
     n = tg3__vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
     if (n < 0) n = 0;
     if ((size_t)n >= sizeof(buf)) n = (int)(sizeof(buf) - 1u);
     if (arena) {
@@ -332,6 +329,25 @@ static void tg3__error_pushf(tg3_error_stack *es, tg3_arena *arena,
         if (dup) msg = dup;
     }
     tg3__error_push(es, sev, code, msg, json_path, -1);
+}
+
+static void tg3__error_pushf(tg3_error_stack *es, tg3_arena *arena,
+                             tg3_severity sev, tg3_error_code code,
+                             const char *json_path, const char *fmt, ...) {
+    va_list ap;
+    if (!es) return;
+    va_start(ap, fmt);
+    tg3__error_pushvf(es, arena, sev, code, json_path, fmt, ap);
+    va_end(ap);
+}
+
+static int tg3__snprintf(char *buf, size_t size, const char *fmt, ...) {
+    int n;
+    va_list ap;
+    va_start(ap, fmt);
+    n = tg3__vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    return n;
 }
 
 TINYGLTF3_API int32_t tg3_errors_has_error(const tg3_error_stack *es) { return es ? es->has_error : 0; }
@@ -2566,8 +2582,504 @@ static uint32_t tg3__validate_spec(tg3__parse_ctx *ctx, const tg3_model *m) {
     return rep.violations;
 }
 
-/* Runs all post-parse checks. Returns TG3_OK or the code of the first failing
- * rule class. */
+/* ---- Attribute / index resource contract -------------------------------
+ * These rules tie mesh primitives to the data they describe:
+ *
+ *   1. every vertex attribute of a primitive has the same element count, and
+ *      its component type/shape is compatible with its semantic (POSITION,
+ *      NORMAL, TANGENT, TEXCOORD_n, COLOR_n, JOINTS_n, WEIGHTS_n;
+ *      KHR_mesh_quantization relaxes the types);
+ *   2. an element of an interleaved accessor fits inside one stride slot
+ *      (byteOffset + element size <= byteStride);
+ *   3. index values stay below the primitive's vertex count;
+ *   4. morph-target attributes keep the base vertex count, name an attribute
+ *      that also exists on the base primitive, and mesh.weights matches the
+ *      target count.
+ *
+ * These are spec-conformance diagnostics: TG3_SEVERITY_WARNING under
+ * TG3_PERMISSIVE (the parse result is unchanged) and TG3_SEVERITY_ERROR under
+ * TG3_STRICT. Every diagnostic carries the JSON path of the offending object,
+ * e.g. "/meshes/0/primitives/1/attributes/POSITION". */
+
+#define TG3__CONTRACT_REPORT_CAP 64u
+/* Upper bound on index values read across the whole model, so a document
+ * that shares one huge index accessor between many primitives cannot turn
+ * validation into a CPU amplifier. */
+#define TG3__CONTRACT_INDEX_SCAN_CAP (1u << 24)
+
+/* Copies a semantic into `buf` for diagnostics. Never reads past key->len. */
+static void tg3__contract_semantic(char *buf, size_t cap, const tg3_str *key) {
+    uint32_t n = (key && key->data) ? key->len : 0u;
+    uint32_t i;
+    if (cap == 0u) return;
+    if ((uint64_t)n > (uint64_t)(cap - 1u)) n = (uint32_t)(cap - 1u);
+    for (i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)key->data[i];
+        buf[i] = (c >= 0x20u && c < 0x7fu) ? (char)c : '?';
+    }
+    buf[n] = '\0';
+}
+
+/* Pushes one contract diagnostic. The JSON path is copied into the arena so
+ * the error stack never points at a caller stack buffer; with no arena the
+ * path is dropped (the message alone still locates the object). */
+static void tg3__contract_report(tg3__parse_ctx *ctx, const char *path,
+                                 const char *fmt, ...) {
+    tg3_severity sev;
+    const char *stored_path = NULL;
+    va_list ap;
+    if (!ctx->errors) return;
+    sev = ctx->opts.strictness == TG3_STRICT
+              ? TG3_SEVERITY_ERROR : TG3_SEVERITY_WARNING;
+    if (ctx->arena && path) stored_path = tg3__arena_strdup(ctx->arena, path,
+                                                            TINYGLTF3_STRLEN(path));
+    va_start(ap, fmt);
+    tg3__error_pushvf(ctx->errors, ctx->arena, sev, TG3_ERR_INVALID_VALUE,
+                      stored_path, fmt, ap);
+    va_end(ap);
+}
+
+static const tg3_accessor *tg3__accessor_at(const tg3_model *m, int32_t index) {
+    if (index < 0 || (uint32_t)index >= m->accessors_count) return NULL;
+    return &m->accessors[index];
+}
+
+static const tg3_buffer_view *tg3__buffer_view_at(const tg3_model *m, int32_t index) {
+    if (index < 0 || (uint32_t)index >= m->buffer_views_count) return NULL;
+    return &m->buffer_views[index];
+}
+
+/* Matches "PREFIX<digits>" semantics (TEXCOORD_0, COLOR_1, ...). The digit
+ * run is capped at 6 so a multi-megabyte attribute name cannot turn this into
+ * a long scan; glTF semantic indices are small non-negative integers. */
+#define TG3__SEMANTIC_INDEX_DIGITS 6u
+static int tg3__semantic_indexed(const tg3_str *key, const char *prefix) {
+    uint32_t plen = (uint32_t)TINYGLTF3_STRLEN(prefix);
+    uint32_t i;
+    if (!key || !key->data || key->len <= plen) return 0;
+    if (key->len - plen > TG3__SEMANTIC_INDEX_DIGITS) return 0;
+    if (TINYGLTF3_MEMCMP(key->data, prefix, plen) != 0) return 0;
+    for (i = plen; i < key->len; ++i) {
+        unsigned char c = (unsigned char)key->data[i];
+        if (c < '0' || c > '9') return 0;
+    }
+    return 1;
+}
+
+/* Type/shape rules for one attribute semantic. Returns NULL when the accessor
+ * is compatible, otherwise a static explanation. `morph_target` selects the
+ * morph-target shape rules (TANGENT is VEC3 there); `quantized` mirrors
+ * KHR_mesh_quantization, which only widens the *component types* of POSITION,
+ * NORMAL, TANGENT and TEXCOORD_n to normalized signed integers — shapes, and
+ * the COLOR/JOINTS/WEIGHTS rules, are unchanged. */
+static const char *tg3__attribute_type_error(const tg3_str *key,
+                                             const tg3_accessor *a,
+                                             int morph_target, int quantized) {
+    int32_t ct = a->component_type;
+    int32_t ty = a->type;
+    int normalized = a->normalized != 0;
+    int ct_float = ct == TG3_COMPONENT_TYPE_FLOAT;
+    int ct_u8 = ct == TG3_COMPONENT_TYPE_UNSIGNED_BYTE;
+    int ct_u16 = ct == TG3_COMPONENT_TYPE_UNSIGNED_SHORT;
+    int ct_signed_norm = normalized &&
+        (ct == TG3_COMPONENT_TYPE_BYTE || ct == TG3_COMPONENT_TYPE_SHORT);
+    if (tg3__str_eq_cstr(key, "POSITION") || tg3__str_eq_cstr(key, "NORMAL")) {
+        if (ty != TG3_TYPE_VEC3) return "semantic requires a VEC3 accessor";
+        if (ct_float && !normalized) return NULL;
+        if (quantized && ct_signed_norm) return NULL;
+        return "semantic requires FLOAT or (with KHR_mesh_quantization) "
+               "normalized BYTE/SHORT";
+    }
+    if (tg3__str_eq_cstr(key, "TANGENT")) {
+        int32_t want = morph_target ? TG3_TYPE_VEC3 : TG3_TYPE_VEC4;
+        if (ty != want) {
+            return morph_target ? "morph target TANGENT requires a VEC3 accessor"
+                                : "semantic requires a VEC4 accessor";
+        }
+        if (ct_float && !normalized) return NULL;
+        if (quantized && ct_signed_norm) return NULL;
+        return "semantic requires FLOAT or (with KHR_mesh_quantization) "
+               "normalized BYTE/SHORT";
+    }
+    if (tg3__semantic_indexed(key, "TEXCOORD_")) {
+        if (ty != TG3_TYPE_VEC2) return "TEXCOORD_n requires a VEC2 accessor";
+        if (ct_float && !normalized) return NULL;
+        if ((ct_u8 || ct_u16) && normalized) return NULL;
+        if (quantized && ct_signed_norm) return NULL;
+        return "TEXCOORD_n requires FLOAT or normalized UNSIGNED_BYTE/UNSIGNED_SHORT"
+               " (KHR_mesh_quantization also allows normalized BYTE/SHORT)";
+    }
+    if (tg3__semantic_indexed(key, "COLOR_")) {
+        if (ty != TG3_TYPE_VEC3 && ty != TG3_TYPE_VEC4) {
+            return "COLOR_n requires a VEC3 or VEC4 accessor";
+        }
+        if (ct_float && !normalized) return NULL;
+        if ((ct_u8 || ct_u16) && normalized) return NULL;
+        return "COLOR_n requires FLOAT or normalized UNSIGNED_BYTE/UNSIGNED_SHORT";
+    }
+    if (tg3__semantic_indexed(key, "JOINTS_")) {
+        if (ty != TG3_TYPE_VEC4) return "JOINTS_n requires a VEC4 accessor";
+        if ((ct_u8 || ct_u16) && !normalized) return NULL;
+        return "JOINTS_n requires a non-normalized UNSIGNED_BYTE/UNSIGNED_SHORT accessor";
+    }
+    if (tg3__semantic_indexed(key, "WEIGHTS_")) {
+        if (ty != TG3_TYPE_VEC4) return "WEIGHTS_n requires a VEC4 accessor";
+        if (ct_float && !normalized) return NULL;
+        if ((ct_u8 || ct_u16) && normalized) return NULL;
+        return "WEIGHTS_n requires FLOAT or normalized UNSIGNED_BYTE/UNSIGNED_SHORT";
+    }
+    /* Anything else must be a custom "_NAME" attribute. */
+    if (!(key && key->data && key->len > 0u && key->data[0] == '_')) {
+        return "unknown attribute semantic (custom attributes must start with '_')";
+    }
+    return NULL;
+}
+
+static int tg3__model_uses_quantization(const tg3_model *m) {
+    uint32_t i;
+    for (i = 0; i < m->extensions_used_count; ++i) {
+        if (tg3__str_eq_cstr(&m->extensions_used[i], TG3_EXT_MESH_QUANTIZATION)) return 1;
+    }
+    return 0;
+}
+
+/* Geometry of `a` inside `bv`: element size, effective stride and the byte
+ * span of all elements measured from a->byte_offset. Returns 0 if the accessor
+ * geometry is already invalid (tg3__validate_resources reports that). */
+static int tg3__contract_span(const tg3_accessor *a, const tg3_buffer_view *bv,
+                              uint64_t *elem_size, uint64_t *stride,
+                              uint64_t *span) {
+    int32_t comp = tg3_component_size(a->component_type);
+    int32_t num = tg3_num_components(a->type);
+    uint64_t es;
+    uint64_t st;
+    uint64_t last;
+    if (comp <= 0 || num <= 0) return 0;
+    if (tg3__u64_mul_overflow((uint64_t)comp, (uint64_t)num, &es)) return 0;
+    st = bv->byte_stride ? (uint64_t)bv->byte_stride : es;
+    if (st < es) return 0;
+    if (a->count == 0u) {
+        *span = 0u;
+    } else {
+        if (tg3__u64_mul_overflow(a->count - 1u, st, &last)) return 0;
+        if (tg3__u64_add_overflow(last, es, span)) return 0;
+    }
+    *elem_size = es;
+    *stride = st;
+    return 1;
+}
+
+/* 1 when [bv->byteOffset + a->byteOffset, + span) is inside loaded buffer
+ * bytes, so the value scan can read every element. */
+static int tg3__contract_bytes_loaded(const tg3_model *m,
+                                      const tg3_buffer_view *bv,
+                                      const tg3_accessor *a, uint64_t span) {
+    const tg3_buffer *b;
+    uint64_t start;
+    uint64_t end;
+    if (!bv || bv->buffer < 0 || (uint32_t)bv->buffer >= m->buffers_count) return 0;
+    b = &m->buffers[bv->buffer];
+    if (!b->data.data || b->data.count == 0u) return 0;
+    if (tg3__u64_add_overflow(bv->byte_offset, a->byte_offset, &start)) return 0;
+    if (tg3__u64_add_overflow(start, span, &end)) return 0;
+    return end <= b->data.count;
+}
+
+/* Reads one unsigned index at element `k`. The caller has checked the whole
+ * span is loaded, so this always succeeds for index component types. */
+static uint64_t tg3__contract_read_index(const tg3_model *m,
+                                         const tg3_buffer_view *bv,
+                                         const tg3_accessor *a,
+                                         uint64_t stride, uint64_t k) {
+    const tg3_buffer *b = &m->buffers[bv->buffer];
+    uint64_t start = bv->byte_offset + a->byte_offset + k * stride;
+    const uint8_t *p = b->data.data + start;
+    switch (a->component_type) {
+        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE:  return (uint64_t)p[0];
+        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT: return (uint64_t)p[0] | ((uint64_t)p[1] << 8);
+        default: return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+                        ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24);
+    }
+}
+
+static int tg3__attribute_present(const tg3_primitive *p, const tg3_str *key) {
+    uint32_t i;
+    for (i = 0; i < p->attributes_count; ++i) {
+        if (tg3__str_eq(&p->attributes[i].key, key)) return 1;
+    }
+    return 0;
+}
+
+static const tg3_accessor *tg3__attribute_accessor(const tg3_model *m,
+                                                   const tg3_primitive *p,
+                                                   const char *semantic) {
+    uint32_t i;
+    for (i = 0; i < p->attributes_count; ++i) {
+        if (tg3__str_eq_cstr(&p->attributes[i].key, semantic)) {
+            return tg3__accessor_at(m, p->attributes[i].value);
+        }
+    }
+    return NULL;
+}
+
+/* Index accessors must be scalar unsigned integers whose values are all below
+ * `vertex_count`. Declared min/max are used when present; otherwise the loaded
+ * buffer bytes are scanned (when available). */
+static void tg3__contract_indices(tg3__parse_ctx *ctx, const tg3_model *m,
+                                  const tg3_primitive *p, uint32_t mesh_index,
+                                  uint32_t prim_index, uint64_t vertex_count,
+                                  uint32_t *violations, int scan_values) {
+    const tg3_accessor *a = tg3__accessor_at(m, p->indices);
+    const tg3_buffer_view *bv;
+    char path[96];
+    uint64_t elem_size = 0;
+    uint64_t stride = 0;
+    uint64_t span = 0;
+    uint64_t k;
+    if (!a) return; /* out-of-range index is reported by tg3__validate_indices */
+    tg3__snprintf(path, sizeof(path), "/meshes/%u/primitives/%u/indices",
+                  mesh_index, prim_index);
+    if (a->type != TG3_TYPE_SCALAR) {
+        if ((*violations)++ < TG3__CONTRACT_REPORT_CAP) {
+            tg3__contract_report(ctx, path,
+                                 "indices accessor %d must be SCALAR, got type %d",
+                                 p->indices, a->type);
+        }
+        return;
+    }
+    if (a->component_type != TG3_COMPONENT_TYPE_UNSIGNED_BYTE &&
+        a->component_type != TG3_COMPONENT_TYPE_UNSIGNED_SHORT &&
+        a->component_type != TG3_COMPONENT_TYPE_UNSIGNED_INT) {
+        if ((*violations)++ < TG3__CONTRACT_REPORT_CAP) {
+            tg3__contract_report(ctx, path,
+                                 "indices accessor %d must use UNSIGNED_BYTE, "
+                                 "UNSIGNED_SHORT or UNSIGNED_INT componentType, got %d",
+                                 p->indices, a->component_type);
+        }
+        return;
+    }
+    if (vertex_count == 0u) return; /* no attributes to compare against */
+    if (!scan_values || a->count == 0u) return;
+    bv = tg3__buffer_view_at(m, a->buffer_view);
+    if (!bv || !tg3__contract_span(a, bv, &elem_size, &stride, &span)) return;
+    if (!tg3__contract_bytes_loaded(m, bv, a, span)) return;
+    for (k = 0; k < a->count; ++k) {
+        uint64_t value = tg3__contract_read_index(m, bv, a, stride, k);
+        if (value >= vertex_count) {
+            if ((*violations)++ < TG3__CONTRACT_REPORT_CAP) {
+                tg3__contract_report(ctx, path,
+                                     "indices[%llu] = %llu is out of range for "
+                                     "vertex count %llu",
+                                     (unsigned long long)k,
+                                     (unsigned long long)value,
+                                     (unsigned long long)vertex_count);
+            }
+            return; /* one report per primitive is enough */
+        }
+    }
+}
+
+/* Checks the semantic type/shape of one attribute (base or morph target). */
+static void tg3__contract_attribute_type(tg3__parse_ctx *ctx,
+                                         const tg3_accessor *a,
+                                         const tg3_str *key,
+                                         const char *path, int morph_target,
+                                         int quantized, uint32_t *violations) {
+    char semantic[96];
+    const char *problem;
+    if (!a) return;
+    /* Invalid accessor geometry is reported by tg3__validate_resources. */
+    if (tg3_component_size(a->component_type) <= 0 ||
+        tg3_num_components(a->type) <= 0) {
+        return;
+    }
+    problem = tg3__attribute_type_error(key, a, morph_target, quantized);
+    if (!problem) return;
+    tg3__contract_semantic(semantic, sizeof(semantic), key);
+    if ((*violations)++ >= TG3__CONTRACT_REPORT_CAP) return;
+    tg3__contract_report(ctx, path,
+                         "%s '%s' is incompatible: %s "
+                         "(componentType %d, type %d, normalized %d)",
+                         morph_target ? "morph target attribute" : "attribute",
+                         semantic, problem, a->component_type, a->type,
+                         a->normalized);
+}
+
+static uint32_t tg3__validate_attribute_contract(tg3__parse_ctx *ctx,
+                                                 const tg3_model *m) {
+    uint32_t violations = 0u;
+    uint32_t i, j, t, k;
+    uint64_t total_scan = 0;
+    int scan_values;
+    int quantized = tg3__model_uses_quantization(m);
+
+    /* Count the index elements a full value scan would read. Above the cap the
+     * scan is skipped for every primitive (the shape rules still run), which
+     * bounds the work validation can be made to do on an adversarial document.
+     * The sum saturates: Lean specifies it in arbitrary-precision Nat. */
+    for (i = 0; i < m->meshes_count; ++i) {
+        const tg3_mesh *me = &m->meshes[i];
+        for (j = 0; j < me->primitives_count; ++j) {
+            const tg3_primitive *p = &me->primitives[j];
+            const tg3_accessor *a;
+            uint64_t next;
+            if (p->indices < 0) continue;
+            a = tg3__accessor_at(m, p->indices);
+            if (!a) continue;
+            if (tg3__u64_add_overflow(total_scan, a->count, &next)) {
+                total_scan = UINT64_MAX;
+                break;
+            }
+            total_scan = next;
+            if (total_scan > (uint64_t)TG3__CONTRACT_INDEX_SCAN_CAP) break;
+        }
+        if (total_scan > (uint64_t)TG3__CONTRACT_INDEX_SCAN_CAP) break;
+    }
+    scan_values = total_scan <= (uint64_t)TG3__CONTRACT_INDEX_SCAN_CAP;
+
+    /* (2) Interleaved accessors: one element must fit inside its stride slot. */
+    for (i = 0; i < m->accessors_count; ++i) {
+        const tg3_accessor *a = &m->accessors[i];
+        const tg3_buffer_view *bv;
+        uint64_t elem_size = 0;
+        uint64_t stride = 0;
+        uint64_t span = 0;
+        char path[48];
+        if (a->buffer_view < 0) continue;
+        bv = tg3__buffer_view_at(m, a->buffer_view);
+        if (!bv || bv->byte_stride == 0u) continue;
+        if (!tg3__contract_span(a, bv, &elem_size, &stride, &span)) continue;
+        if (elem_size <= stride &&
+            a->byte_offset <= (uint64_t)bv->byte_stride - elem_size) {
+            continue;
+        }
+        if (violations++ >= TG3__CONTRACT_REPORT_CAP) continue;
+        tg3__snprintf(path, sizeof(path), "/accessors/%u", i);
+        tg3__contract_report(ctx, path,
+                             "accessor %u byteOffset %llu + element size %llu "
+                             "crosses byteStride %u of bufferViews[%d]",
+                             i, (unsigned long long)a->byte_offset,
+                             (unsigned long long)elem_size,
+                             bv->byte_stride, a->buffer_view);
+    }
+
+    for (i = 0; i < m->meshes_count; ++i) {
+        const tg3_mesh *me = &m->meshes[i];
+        for (j = 0; j < me->primitives_count; ++j) {
+            const tg3_primitive *p = &me->primitives[j];
+            const tg3_accessor *position;
+            uint64_t vertex_count = 0u;
+            char path[192];
+            char semantic[96];
+
+            /* Every primitive of one mesh must expose the same morph targets,
+             * and mesh.weights must match that target count. */
+            if (j > 0 && p->targets_count != me->primitives[0].targets_count) {
+                if (violations++ < TG3__CONTRACT_REPORT_CAP) {
+                    tg3__snprintf(path, sizeof(path),
+                                  "/meshes/%u/primitives/%u/targets", i, j);
+                    tg3__contract_report(ctx, path,
+                                         "primitive %u has %u morph targets but "
+                                         "primitives[0] has %u; every primitive of "
+                                         "a mesh must declare the same targets",
+                                         j, p->targets_count,
+                                         me->primitives[0].targets_count);
+                }
+            }
+            if (me->weights_count > 0u && p->targets_count != me->weights_count) {
+                if (violations++ < TG3__CONTRACT_REPORT_CAP) {
+                    tg3__snprintf(path, sizeof(path), "/meshes/%u/weights", i);
+                    tg3__contract_report(ctx, path,
+                                         "mesh has %u morph weights but primitive %u "
+                                         "has %u morph targets",
+                                         me->weights_count, j, p->targets_count);
+                }
+            }
+
+            if (!p->attributes || p->attributes_count == 0u) continue;
+
+            /* (1) Vertex count comes from POSITION when present, else from the
+             * first attribute; every attribute must agree with it. */
+            position = tg3__attribute_accessor(m, p, "POSITION");
+            if (position) {
+                vertex_count = position->count;
+            } else {
+                const tg3_accessor *first =
+                    tg3__accessor_at(m, p->attributes[0].value);
+                if (first) vertex_count = first->count;
+            }
+            for (k = 0; k < p->attributes_count; ++k) {
+                const tg3_str_int_pair *pair = &p->attributes[k];
+                const tg3_accessor *a = tg3__accessor_at(m, pair->value);
+                if (!a) continue; /* reported by tg3__validate_indices */
+                tg3__contract_semantic(semantic, sizeof(semantic), &pair->key);
+                if (vertex_count != 0u && a->count != vertex_count) {
+                    if (violations++ < TG3__CONTRACT_REPORT_CAP) {
+                        tg3__snprintf(path, sizeof(path),
+                                      "/meshes/%u/primitives/%u/attributes/%s",
+                                      i, j, semantic);
+                        tg3__contract_report(ctx, path,
+                                             "attribute '%s' has %llu elements but "
+                                             "the primitive has %llu vertices",
+                                             semantic,
+                                             (unsigned long long)a->count,
+                                             (unsigned long long)vertex_count);
+                    }
+                }
+                tg3__snprintf(path, sizeof(path),
+                              "/meshes/%u/primitives/%u/attributes/%s",
+                              i, j, semantic);
+                tg3__contract_attribute_type(ctx, a, &pair->key, path, 0,
+                                             quantized, &violations);
+            }
+
+            /* (3) Index values must stay below the vertex count. */
+            if (p->indices >= 0) {
+                tg3__contract_indices(ctx, m, p, i, j, vertex_count, &violations,
+                                      scan_values);
+            }
+
+            /* (4) Morph targets follow the base primitive. */
+            for (t = 0; t < p->targets_count; ++t) {
+                uint32_t tcount = p->target_attribute_counts
+                                      ? p->target_attribute_counts[t] : 0u;
+                const tg3_str_int_pair *tarr = p->targets ? p->targets[t] : NULL;
+                if (!tarr) continue;
+                for (k = 0; k < tcount; ++k) {
+                    const tg3_str_int_pair *pair = &tarr[k];
+                    const tg3_accessor *a = tg3__accessor_at(m, pair->value);
+                    if (!a) continue;
+                    tg3__contract_semantic(semantic, sizeof(semantic), &pair->key);
+                    tg3__snprintf(path, sizeof(path),
+                                  "/meshes/%u/primitives/%u/targets/%u/%s",
+                                  i, j, t, semantic);
+                    if (vertex_count != 0u && a->count != vertex_count) {
+                        if (violations++ < TG3__CONTRACT_REPORT_CAP) {
+                            tg3__contract_report(ctx, path,
+                                                 "morph target '%s' has %llu elements "
+                                                 "but the base primitive has %llu vertices",
+                                                 semantic,
+                                                 (unsigned long long)a->count,
+                                                 (unsigned long long)vertex_count);
+                        }
+                    }
+                    if (!tg3__attribute_present(p, &pair->key)) {
+                        if (violations++ < TG3__CONTRACT_REPORT_CAP) {
+                            tg3__contract_report(ctx, path,
+                                                 "morph target '%s' has no matching "
+                                                 "base primitive attribute",
+                                                 semantic);
+                        }
+                    }
+                    tg3__contract_attribute_type(ctx, a, &pair->key, path, 1,
+                                                 quantized, &violations);
+                }
+            }
+        }
+    }
+    return violations;
+}
+
 static tg3_error_code tg3__validate_model(tg3__parse_ctx *ctx, const tg3_model *m) {
     tg3_error_code ret = TG3_OK;
     if (ctx->opts.validate_indices && !tg3__validate_indices(ctx, m)) {
@@ -2577,6 +3089,10 @@ static tg3_error_code tg3__validate_model(tg3__parse_ctx *ctx, const tg3_model *
         if (ret == TG3_OK) ret = TG3_ERR_INVALID_ACCESSOR;
     }
     if (tg3__validate_spec(ctx, m) > 0u && ctx->opts.strictness == TG3_STRICT) {
+        if (ret == TG3_OK) ret = TG3_ERR_INVALID_VALUE;
+    }
+    if (tg3__validate_attribute_contract(ctx, m) > 0u &&
+        ctx->opts.strictness == TG3_STRICT) {
         if (ret == TG3_OK) ret = TG3_ERR_INVALID_VALUE;
     }
     return ret;

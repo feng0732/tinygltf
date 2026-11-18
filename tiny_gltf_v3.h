@@ -267,9 +267,19 @@ extern "C" {
 /* Parse strictness.
  *
  * Spec-conformance rules (enum values, value ranges, required non-empty
- * arrays, ...; see formal/GlTF/Validate.lean for the normative list) are
- * reported as TG3_SEVERITY_WARNING under TG3_PERMISSIVE (the default) and as
+ * arrays, attribute/index resource contracts, ...; see
+ * formal/GlTF/Validate.lean for the normative list) are reported as
+ * TG3_SEVERITY_WARNING under TG3_PERMISSIVE (the default) and as
  * TG3_SEVERITY_ERROR (parse fails) under TG3_STRICT.
+ *
+ * The attribute contract ties primitives to their data: vertex attributes
+ * (POSITION/NORMAL/TANGENT/TEXCOORD_n/COLOR_n/JOINTS_n/WEIGHTS_n) must agree
+ * on element count and use a component type/shape the semantic allows
+ * (KHR_mesh_quantization relaxes the types); interleaved accessors must not
+ * straddle a stride slot; index values must stay below the vertex count; and
+ * morph targets must keep the base count and match mesh.weights. Each such
+ * diagnostic carries the JSON path of the offending object, e.g.
+ * "/meshes/0/primitives/1/attributes/POSITION".
  *
  * Memory-safety rules (out-of-range indices and byte ranges, unknown
  * component types) are always errors, independent of strictness; they can

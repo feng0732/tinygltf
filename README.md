@@ -15,6 +15,7 @@ https://github.com/KhronosGroup/glTF loader and writer, with experimental
 - **C++20 coroutine facade** (optional, auto-detected). C17/C++17 default.
 - **Hardened against untrusted input** — URI sanitization, post-parse index-bounds and byte-range validation (default-on, opt-out via `tg3_parse_options.validate_indices` / `validate_ranges`), strict numeric range checks; exercised by a libFuzzer harness. See the `Security Considerations` block at the top of `tiny_gltf_v3.h`.
 - **Strictness levels** — spec-conformance violations are warnings by default (`TG3_PERMISSIVE`) and errors under `TG3_STRICT`; `tg3_validate()` checks hand-built models with the same rules.
+- **Attribute/index resource contract** — mesh primitives are checked against the data they describe: POSITION/NORMAL/TANGENT/TEXCOORD_n/COLOR_n/JOINTS_n/WEIGHTS_n must agree on element count and use a component type/shape the semantic allows (KHR_mesh_quantization relaxes the types), interleaved accessors must not straddle a byteStride slot, index values must stay below the vertex count, and morph targets must keep the base count and match `mesh.weights`. Each diagnostic names the offending JSON path (e.g. `/meshes/0/primitives/1/attributes/POSITION`); permissive parsing is unchanged, strict parsing fails.
 - **Formal specification and machine-checked proofs** — a Lean 4 specification of the validation rules and GLB framing, and a Lean proof that the C GLB framing code is free of undefined behaviour and refines the specification. See [`formal/`](formal/README.md).
 
 ## Update log

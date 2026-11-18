@@ -110,6 +110,194 @@ def animationMask (a : Animation) : UInt32 :=
 def modelMask (m : Model) : UInt32 :=
   flag (m.extensionsRequired.any (fun e => !(m.extensionsUsed.contains e))) 0
 
+/-! ## Attribute / index resource contract (`tg3__validate_attribute_contract`)
+
+These rules tie primitives to the data they describe. They are spec
+conformance: warnings under `TG3_PERMISSIVE`, errors under `TG3_STRICT`, and
+they never change a parsed field. -/
+
+/-- `tg3__semantic_indexed`: `prefix` followed by 1..6 ASCII digits
+    (`TG3__SEMANTIC_INDEX_DIGITS`). -/
+def semanticIndexed (key : Bytes) (pfx : String) : Bool :=
+  let p := str pfx
+  decide (p.length < key.length ∧ key.length - p.length ≤ 6) &&
+    key.take p.length == p &&
+    (key.drop p.length).all (fun c => decide (48 ≤ c.toNat ∧ c.toNat ≤ 57))
+
+def isSemantic (key : Bytes) (name : String) : Bool := key == str name
+
+/-- `tg3__attribute_type_error` = `false`. `morph` selects the morph-target
+    TANGENT shape; `quantized` mirrors KHR_mesh_quantization, which only
+    widens the component types of POSITION/NORMAL/TANGENT/TEXCOORD_n to
+    normalized signed integers. -/
+def attrTypeOk (key : Bytes) (a : Accessor) (morph : Bool) (quantized : Bool) : Bool :=
+  let ctFloat := a.componentType == CT.float && a.normalized == 0
+  let ctUNorm := (a.componentType == CT.ubyte || a.componentType == CT.ushort) &&
+                 a.normalized != 0
+  let ctSNorm := quantized && a.normalized != 0 &&
+                 (a.componentType == CT.byte || a.componentType == CT.short)
+  if isSemantic key "POSITION" ∨ isSemantic key "NORMAL" then
+    a.type == AT.vec3 && (ctFloat || ctSNorm)
+  else if isSemantic key "TANGENT" then
+    (if morph then a.type == AT.vec3 else a.type == AT.vec4) && (ctFloat || ctSNorm)
+  else if semanticIndexed key "TEXCOORD_" then
+    a.type == AT.vec2 && (ctFloat || ctUNorm || ctSNorm)
+  else if semanticIndexed key "COLOR_" then
+    (a.type == AT.vec3 || a.type == AT.vec4) && (ctFloat || ctUNorm)
+  else if semanticIndexed key "JOINTS_" then
+    a.type == AT.vec4 && (a.componentType == CT.ubyte || a.componentType == CT.ushort) &&
+      a.normalized == 0
+  else if semanticIndexed key "WEIGHTS_" then
+    a.type == AT.vec4 && (ctFloat || ctUNorm)
+  else
+    -- custom attributes must start with '_'
+    key.head? == some 95
+
+/-- Accessor geometry in a buffer view: `(elemSize, stride, span)`; `none`
+    mirrors `tg3__contract_span` returning 0 (already-invalid geometry). -/
+def contractSpan (a : Accessor) (bv : BufferView) : Option (Nat × Nat × Nat) :=
+  let cs := componentSize a.componentType
+  let nc := numComponents a.type
+  if cs ≤ 0 || nc ≤ 0 then none
+  else
+    let es := cs.toInt.toNat * nc.toInt.toNat
+    let st := if bv.byteStride != 0 then bv.byteStride.toNat else es
+    if st < es then none
+    else if a.count.toNat = 0 then some (es, st, 0)
+    else some (es, st, (a.count.toNat - 1) * st + es)
+
+/-- One interleaved accessor's element fits inside its stride slot. -/
+def interleaveOk (m : Model) (a : Accessor) : Bool :=
+  if a.bufferView < 0 then true
+  else match getIdx? m.bufferViews a.bufferView with
+  | none => true
+  | some bv =>
+    if bv.byteStride == 0 then true
+    else match contractSpan a bv with
+    | none => true
+    | some (es, st, _) => decide (es ≤ st) && decide (a.byteOffset.toNat + es ≤ st)
+
+/-- The whole index span is inside the bytes actually loaded. -/
+def indexBytesLoaded (m : Model) (bv : BufferView) (a : Accessor) (span : Nat) : Bool :=
+  match getIdx? m.buffers bv.buffer with
+  | none => false
+  | some b =>
+    !b.data.isEmpty &&
+      decide (bv.byteOffset.toNat + a.byteOffset.toNat + span ≤ b.data.length)
+
+/-- Little-endian unsigned index value at element `k`. -/
+def readIndex (m : Model) (bv : BufferView) (a : Accessor) (stride k : Nat) : Option Nat :=
+  match getIdx? m.buffers bv.buffer with
+  | none => none
+  | some b =>
+    let start := bv.byteOffset.toNat + a.byteOffset.toNat + k * stride
+    let comp := (componentSize a.componentType).toInt.toNat
+    match b.data.drop start with
+    | b0 :: rest =>
+      if comp = 1 then some b0.toNat
+      else match rest with
+        | b1 :: rest1 =>
+          if comp = 2 then some (b0.toNat + 256 * b1.toNat)
+          else match rest1 with
+            | b2 :: b3 :: _ => some (b0.toNat + 256 * b1.toNat + 65536 * b2.toNat +
+                                     16777216 * b3.toNat)
+            | _ => none
+        | [] => none
+    | [] => none
+
+/-- `tg3__CONTRACT_INDEX_SCAN_CAP`. -/
+def indexScanCap : Nat := 2 ^ 24
+
+/-- Total index elements a full value scan would read across the model. -/
+def indexScanTotal (m : Model) : Nat :=
+  (m.meshes.flatMap (fun me => me.primitives)).foldl
+    (fun acc p =>
+      match getIdx? m.accessors p.indices with
+      | none => acc
+      | some a => acc + a.count.toNat) 0
+
+/-- The C runtime skips every index value scan when the total exceeds the cap;
+    the shape rules still apply. -/
+def scanValuesOk (m : Model) : Bool :=
+  decide (indexScanTotal m ≤ indexScanCap)
+
+/-- `tg3__contract_indices`: index accessor shape plus every value in range. -/
+def indicesContractOk (m : Model) (p : Primitive) (vertexCount : Nat)
+    (scanValues : Bool) : Bool :=
+  match getIdx? m.accessors p.indices with
+  | none => true
+  | some a =>
+    if a.type != AT.scalar then false
+    else if !(a.componentType == CT.ubyte || a.componentType == CT.ushort ||
+              a.componentType == CT.uint) then false
+    else if vertexCount = 0 then true
+    else if !scanValues || a.count.toNat = 0 then true
+    else match getIdx? m.bufferViews a.bufferView with
+      | none => true
+      | some bv =>
+        match contractSpan a bv with
+        | none => true
+        | some (_, st, span) =>
+          if !indexBytesLoaded m bv a span then true
+          else (List.range a.count.toNat).all (fun k =>
+            match readIndex m bv a st k with
+            | none => true
+            | some v => decide (v < vertexCount))
+
+/-- Count of a primitive attribute by semantic, if it names a valid accessor. -/
+def attrAccessor? (m : Model) (p : Primitive) (name : String) : Option Accessor :=
+  match p.attributes.find? (fun kv => kv.1 == str name) with
+  | none => none
+  | some kv => getIdx? m.accessors kv.2
+
+def primitiveAttributesOk (m : Model) (p : Primitive) (quantized scanValues : Bool) : Bool :=
+  match p.attributes with
+  | [] => true
+  | first :: _ =>
+    let vertexCount :=
+      match attrAccessor? m p "POSITION" with
+      | some a => a.count.toNat
+      | none => match getIdx? m.accessors first.2 with
+        | some a => a.count.toNat
+        | none => 0
+    let attrOk (kv : Bytes × Int32) : Bool :=
+      match getIdx? m.accessors kv.2 with
+      | none => true
+      | some a =>
+        (vertexCount = 0 || a.count.toNat = vertexCount) &&
+        (componentSize a.componentType ≤ 0 || numComponents a.type ≤ 0 ||
+          attrTypeOk kv.1 a false quantized)
+    let targetOk (t : List (Bytes × Int32)) : Bool :=
+      t.all (fun kv =>
+        match getIdx? m.accessors kv.2 with
+        | none => true
+        | some a =>
+          (vertexCount = 0 || a.count.toNat = vertexCount) &&
+          (p.attributes.any (fun b => b.1 == kv.1)) &&
+          (componentSize a.componentType ≤ 0 || numComponents a.type ≤ 0 ||
+            attrTypeOk kv.1 a true quantized))
+    p.attributes.all attrOk && indicesContractOk m p vertexCount scanValues &&
+      p.targets.all targetOk
+
+/-- All primitives of a mesh declare the same number of morph targets. -/
+def meshTargetsConsistent (me : Mesh) : Bool :=
+  match me.primitives with
+  | [] => true
+  | first :: _ => me.primitives.all (fun p => p.targets.length = first.targets.length)
+
+/-- `mesh.weights`, when present, matches each primitive's target count. -/
+def meshWeightsOk (me : Mesh) : Bool :=
+  me.weights.isEmpty ||
+    me.primitives.all (fun p => p.targets.length = me.weights.length)
+
+def contractOk (m : Model) : Bool :=
+  let quantized := m.extensionsUsed.contains (str "KHR_mesh_quantization")
+  let scanValues := scanValuesOk m
+  m.accessors.all (interleaveOk m) &&
+  m.meshes.all (fun me =>
+    meshTargetsConsistent me && meshWeightsOk me &&
+    me.primitives.all (fun p => primitiveAttributesOk m p quantized scanValues))
+
 /-- No spec-conformance rule is violated anywhere in the model. -/
 def specOk (m : Model) : Bool :=
   modelMask m == 0 &&
@@ -122,7 +310,8 @@ def specOk (m : Model) : Bool :=
   m.samplers.all (fun x => samplerMask x == 0) &&
   m.skins.all (fun x => skinMask x == 0) &&
   m.lights.all (fun x => lightMask x == 0) &&
-  m.animations.all (fun x => animationMask x == 0)
+  m.animations.all (fun x => animationMask x == 0) &&
+  contractOk m
 
 /-- `tg3_component_size` as returned by the C runtime (`-1` as `u32`). -/
 def componentSizeU (ct : Int32) : Nat :=

@@ -65,6 +65,131 @@ example : validate {} (accRange 23) = .invalidAccessor := by decide
 example : validate {} { materials := [{ normalTexture := { index := 7 } }] } = .invalidIndex := by
   decide
 
+/-! ## Attribute / index resource contract (`contractOk`)
+
+These mirror the C tests in `check_attribute_contract`,
+`check_morph_target_contract`, `check_index_value_contract` and
+`check_contract_accepts_valid_model`. -/
+
+/-- Three VEC3 float vertices in one tightly packed view. -/
+def pos3 : Accessor :=
+  { bufferView := 0, componentType := CT.float, count := 3, type := AT.vec3 }
+
+def posModel (attrs : List (Bytes × Int32)) (accessors : List Accessor) : Model :=
+  { buffers := [{ byteLength := 256 }],
+    bufferViews := [{ buffer := 0, byteLength := 36 }],
+    accessors := accessors,
+    meshes := [{ primitives := [{ attributes := attrs }] }] }
+
+/-- POSITION + NORMAL with matching lengths and shapes is accepted. -/
+example : contractOk (posModel [(str "POSITION", 0), (str "NORMAL", 0)] [pos3]) = true := by
+  decide
+
+/-- A NORMAL accessor with a different element count is rejected. -/
+example : contractOk (posModel [(str "POSITION", 0), (str "NORMAL", 1)]
+    [pos3, { pos3 with count := 4 }]) = false := by
+  decide
+
+/-- POSITION must be FLOAT VEC3. -/
+example : contractOk (posModel [(str "POSITION", 0)]
+    [{ pos3 with type := AT.vec2 }]) = false := by
+  decide
+
+/-- TANGENT on a base primitive is FLOAT VEC4; on a morph target it is VEC3. -/
+example : contractOk (posModel [(str "POSITION", 0), (str "TANGENT", 0)] [pos3]) = false := by
+  decide
+example : contractOk
+    { posModel [(str "POSITION", 0)] [pos3] with
+      meshes := [{ primitives := [{ attributes := [(str "POSITION", 0)],
+                                    targets := [[(str "POSITION", 0)]] }] }] } = true := by
+  decide
+
+/-- Unknown semantics are rejected; "_CUSTOM" is allowed. -/
+example : contractOk (posModel [(str "POSITION", 0), (str "FOO", 0)] [pos3]) = false := by
+  decide
+example : contractOk (posModel [(str "POSITION", 0), (str "_CUSTOM", 0)] [pos3]) = true := by
+  decide
+
+/-- An element crossing its stride slot is rejected: offset 8 + VEC3 (12) > 16. -/
+example : interleaveOk
+    { bufferViews := [{ buffer := 0, byteLength := 72, byteStride := 16 }] }
+    { pos3 with byteOffset := 8 } = false := by
+  decide
+/-- offset 4 + 12 = 16 exactly fills the slot; offset 5 crosses it. -/
+example : interleaveOk
+    { bufferViews := [{ buffer := 0, byteLength := 72, byteStride := 16 }] }
+    { pos3 with byteOffset := 4 } = true := by
+  decide
+example : interleaveOk
+    { bufferViews := [{ buffer := 0, byteLength := 72, byteStride := 16 }] }
+    { pos3 with byteOffset := 5 } = false := by
+  decide
+example : interleaveOk
+    { bufferViews := [{ buffer := 0, byteLength := 96, byteStride := 48 }] }
+    { pos3 with byteOffset := 12 } = true := by
+  decide
+
+/-- Morph targets must keep the base vertex count and match mesh.weights. -/
+def targetModel (targetCount : UInt64) (weights : List F64) : Model :=
+  { buffers := [{ byteLength := 256 }],
+    bufferViews := [{ buffer := 0, byteLength := 36 }],
+    accessors := [pos3, { pos3 with count := targetCount }],
+    meshes := [{ weights := weights,
+                 primitives := [{ attributes := [(str "POSITION", 0)],
+                                  targets := [[(str "POSITION", 1)]] }] }] }
+
+example : contractOk (targetModel 3 [F64.half]) = true := by decide +kernel
+example : contractOk (targetModel 2 [F64.half]) = false := by decide +kernel
+example : contractOk (targetModel 3 []) = true := by decide +kernel
+example : contractOk (targetModel 3 [F64.half, F64.half]) = false := by decide +kernel
+
+/-- Index values are read from the loaded bytes; (0,1,5) is out of range for
+    three vertices while (0,1,2) is accepted. -/
+def idxModel (bytes : List UInt8) : Model :=
+  { buffers := [{ byteLength := 44, dataCount := 44, data := bytes }],
+    bufferViews := [{ buffer := 0, byteLength := 6 },
+                    { buffer := 0, byteOffset := 8, byteLength := 36 }],
+    accessors := [{ bufferView := 0, componentType := CT.ushort, count := 3,
+                    type := AT.scalar },
+                  { bufferView := 1, componentType := CT.float, count := 3, type := AT.vec3 }],
+    meshes := [{ primitives := [{ attributes := [(str "POSITION", 1)],
+                                  indices := 0 }] }] }
+
+def pad (n : Nat) (xs : List UInt8) : List UInt8 := xs ++ List.replicate n 0
+
+example : contractOk (idxModel (pad 38 [0, 0, 1, 0, 5, 0])) = false := by decide
+example : contractOk (idxModel (pad 38 [0, 0, 1, 0, 2, 0])) = true := by decide
+
+/-- An index accessor must be SCALAR and unsigned. -/
+example : contractOk
+    { idxModel (pad 38 [0, 0, 1, 0, 2, 0]) with
+      accessors := [{ bufferView := 0, componentType := CT.float, count := 3,
+                      type := AT.scalar }] } = false := by decide
+
+/-- KHR_mesh_quantization widens only the component types of POSITION/NORMAL/
+    TANGENT/TEXCOORD_n, and only to normalized signed integers; shapes stay. -/
+example : contractOk
+    { posModel [(str "POSITION", 0)]
+        [{ pos3 with componentType := CT.short, normalized := 1 }] with
+      extensionsUsed := [str "KHR_mesh_quantization"] } = true := by decide
+/-- ... but not without the extension, and not un-normalized. -/
+example : contractOk
+    (posModel [(str "POSITION", 0)]
+      [{ pos3 with componentType := CT.short, normalized := 1 }]) = false := by decide
+example : contractOk
+    { posModel [(str "POSITION", 0)] [{ pos3 with componentType := CT.short }] with
+      extensionsUsed := [str "KHR_mesh_quantization"] } = false := by decide
+/-- ... and it never relaxes the VEC3 shape of POSITION. -/
+example : contractOk
+    { posModel [(str "POSITION", 0)]
+        [{ pos3 with type := AT.vec2, componentType := CT.short, normalized := 1 }] with
+      extensionsUsed := [str "KHR_mesh_quantization"] } = false := by decide
+/-- ... nor the JOINTS_n rules. -/
+example : contractOk
+    { posModel [(str "POSITION", 0), (str "JOINTS_0", 1)]
+        [pos3, { pos3 with type := AT.vec4, componentType := CT.byte, normalized := 1 }] with
+      extensionsUsed := [str "KHR_mesh_quantization"] } = false := by decide
+
 /-! GLB framing -/
 
 deriving instance DecidableEq for Except

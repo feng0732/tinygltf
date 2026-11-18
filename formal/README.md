@@ -19,6 +19,12 @@ depends only on Lean's three standard axioms (`propext`, `Classical.choice`,
 
 ## Update log
 
+- **2026-11-18** — Attribute/index resource contract added to the spec
+  (`Validate.contractOk`: semantic/component-type compatibility, interleaved
+  byteStride slots, index values vs vertex count, morph targets vs base
+  attributes and `mesh.weights`) and to the C runtime
+  (`tg3__validate_attribute_contract`), with kernel-checked tests in
+  `GlTF/Tests.lean` and unit tests in `tests/tester_v3_c.c`.
 - **2026-11-07** — T1 complete: GLB parse, byte writers, header writers, and
   `tg3__glb_layout` (`glb_layout_correct`). T3 helpers landed:
   `component_size`, `num_components`, `b64_decoded_len`, `b64_decode_char`.
@@ -62,7 +68,7 @@ python3 tools/cdiff.py --n 1000             # compiled C == MiniC == spec on ran
 |---|---|
 | `GlTF/Basic.lean` | `F64` (IEEE-754 doubles as bit patterns, with C comparison semantics), byte strings, index helpers |
 | `GlTF/Model.lean` | the glTF object model, field-for-field with the `tg3_*` structs |
-| `GlTF/Validate.lean` | normative validation rules: `indicesOk`, `rangesOk` (memory safety) and `*Mask` (spec conformance), `validate`, `WellFormedSafe`, `WellFormedStrict` |
+| `GlTF/Validate.lean` | normative validation rules: `indicesOk`, `rangesOk` (memory safety), `*Mask` and `contractOk` (spec conformance), `validate`, `WellFormedSafe`, `WellFormedStrict` |
 | `GlTF/Glb.lean` | GLB v2 / v3 (glTF 2.1, spec-unstable) framing: `parseFrame`, `layout`, `parseFrame_ok_in` |
 | `GlTF/Safety.lean` | theorems about the validation spec |
 | `GlTF/Tests.lean` | kernel-checked regression tests, incl. MiniC negative controls (out-of-bounds access is UB) |
@@ -107,6 +113,7 @@ inputs and requires all three to agree.
 | `Validate.indicesOk` | `tg3__validate_indices` |
 | `Validate.rangesOk` | `tg3__validate_resources` |
 | `Validate.bufferMask`, …, `Validate.modelMask` | `tg3__spec_buffer_mask`, …, `tg3__spec_model_mask` (same bit numbers as the `TG3__R_*` macros) |
+| `Validate.contractOk` | `tg3__validate_attribute_contract` (part of the spec-conformance verdict) |
 | `Validate.validate` | `tg3__validate_model` / `tg3_validate` |
 | `Glb.parseFrame` | `tg3__glb_frame_parse` |
 | `Glb.layout` | `tg3__glb_layout` |

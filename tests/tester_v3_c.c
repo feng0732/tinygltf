@@ -1923,6 +1923,363 @@ static int check_strict_accepts_valid_model(void) {
   return 1;
 }
 
+/* ---- Attribute / index resource contract ---- */
+
+/* Parses `json` and returns the number of contract diagnostics (code
+ * INVALID_VALUE) at `sev`; also reports the parse result through *out_err. */
+static int contract_diags(const char *json, tg3_strictness strictness,
+                          tg3_severity sev, tg3_error_code *out_err) {
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  int n;
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  opts.strictness = strictness;
+  *out_err = tg3_parse(&model, &errors, (const uint8_t *)json, strlen(json),
+                       "", 0, &opts);
+  n = count_severity(&errors, sev, TG3_ERR_INVALID_VALUE);
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return n;
+}
+
+/* Every accepted case must be a warning (result unchanged) in permissive mode
+ * and an error in strict mode. Also checks the diagnostic is locatable. */
+static int check_contract_case(const char *name, const char *json,
+                               const char *want_path) {
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  uint32_t i;
+  int found = 0;
+
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, (const uint8_t *)json, strlen(json), "", 0, &opts);
+  if (err != TG3_OK) {
+    fprintf(stderr, "contract %s: permissive parse failed (%d)\n", name, (int)err);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  for (i = 0; i < tg3_errors_count(&errors); ++i) {
+    const tg3_error_entry *e = tg3_errors_get(&errors, i);
+    if (e->severity == TG3_SEVERITY_WARNING && e->code == TG3_ERR_INVALID_VALUE &&
+        (!want_path || (e->json_path && strstr(e->json_path, want_path)))) {
+      found = 1;
+    }
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  if (!found) {
+    fprintf(stderr, "contract %s: missing permissive warning at %s\n", name,
+            want_path ? want_path : "(any)");
+    return 0;
+  }
+
+  if (contract_diags(json, TG3_STRICT, TG3_SEVERITY_ERROR, &err) < 1) {
+    fprintf(stderr, "contract %s: missing strict error\n", name);
+    return 0;
+  }
+  if (err != TG3_ERR_INVALID_VALUE) {
+    fprintf(stderr, "contract %s: strict parse returned %d, want INVALID_VALUE\n",
+            name, (int)err);
+    return 0;
+  }
+  if (contract_diags(json, TG3_PERMISSIVE, TG3_SEVERITY_ERROR, &err) != 0) {
+    fprintf(stderr, "contract %s: permissive mode produced an error\n", name);
+    return 0;
+  }
+  return 1;
+}
+
+static int check_attribute_contract(void) {
+  /* Attribute lengths must all agree with POSITION. */
+  static const char count_mismatch[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36},"
+      "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":48}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+      "{\"bufferView\":1,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1}}]}]}";
+  /* Semantic/component-type compatibility. */
+  static const char pos_vec2[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":24}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  static const char tangent_vec3[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"TANGENT\":0}}]}]}";
+  static const char unknown_semantic[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"FOO\":0}}]}]}";
+  /* Interleaved accessor whose element crosses the stride slot. */
+  static const char stride_crossing[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":72,\"byteStride\":16}],"
+      "\"accessors\":[{\"bufferView\":0,\"byteOffset\":8,\"componentType\":5126,"
+      "\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  if (!check_contract_case("count-mismatch", count_mismatch,
+                           "/meshes/0/primitives/0/attributes/NORMAL")) return 0;
+  if (!check_contract_case("position-vec2", pos_vec2,
+                           "/meshes/0/primitives/0/attributes/POSITION")) return 0;
+  if (!check_contract_case("tangent-vec3", tangent_vec3,
+                           "/meshes/0/primitives/0/attributes/TANGENT")) return 0;
+  if (!check_contract_case("unknown-semantic", unknown_semantic,
+                           "/meshes/0/primitives/0/attributes/FOO")) return 0;
+  if (!check_contract_case("stride-crossing", stride_crossing, "/accessors/0")) return 0;
+  return 1;
+}
+
+static int check_morph_target_contract(void) {
+  static const char target_mismatch[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36},"
+      "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":24}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+      "{\"bufferView\":1,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},"
+      "\"targets\":[{\"POSITION\":1,\"NORMAL\":1}]}]}]}";
+  static const char weights_mismatch[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"weights\":[0.5],\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  if (!check_contract_case("target-length", target_mismatch,
+                           "/meshes/0/primitives/0/targets/0/POSITION")) return 0;
+  if (!check_contract_case("target-no-base-attribute", target_mismatch,
+                           "/meshes/0/primitives/0/targets/0/NORMAL")) return 0;
+  if (!check_contract_case("weights-vs-targets", weights_mismatch,
+                           "/meshes/0/weights")) return 0;
+  return 1;
+}
+
+/* Index values are read from the loaded buffer bytes. */
+static int check_index_value_contract(void) {
+  /* 3 USHORT indices {0,1,5} followed by 3 VEC3 positions (3 vertices). */
+  static const char oob[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64,"
+      "AAABAAUAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAIA/AAAAAAAAAAA=\","
+      "\"byteLength\":44}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":6},"
+      "{\"buffer\":0,\"byteOffset\":8,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5123,\"count\":3,"
+      "\"type\":\"SCALAR\"},"
+      "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":1},"
+      "\"indices\":0}]}]}";
+  /* Same, but indices {0,1,2}: inside the vertex count. */
+  static const char in_range[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"uri\":\"data:application/octet-stream;base64,"
+      "AAABAAIAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAIA/AAAAAAAAAAA=\","
+      "\"byteLength\":44}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":6},"
+      "{\"buffer\":0,\"byteOffset\":8,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5123,\"count\":3,"
+      "\"type\":\"SCALAR\"},"
+      "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":1},"
+      "\"indices\":0}]}]}";
+  tg3_error_code err;
+  if (!check_contract_case("index-value", oob,
+                           "/meshes/0/primitives/0/indices")) return 0;
+  if (contract_diags(in_range, TG3_PERMISSIVE, TG3_SEVERITY_WARNING, &err) != 0 ||
+      contract_diags(in_range, TG3_STRICT, TG3_SEVERITY_ERROR, &err) != 0) {
+    fprintf(stderr, "index contract rejected in-range indices\n");
+    return 0;
+  }
+  if (err != TG3_OK) {
+    fprintf(stderr, "index contract in-range strict parse returned %d\n", (int)err);
+    return 0;
+  }
+  return 1;
+}
+
+/* A model that satisfies the whole contract parses cleanly under TG3_STRICT
+ * and keeps its parsed fields unchanged under TG3_PERMISSIVE. */
+static int check_contract_accepts_valid_model(void) {
+  static const char json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":1024}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":144,\"byteStride\":48},"
+      "{\"buffer\":0,\"byteOffset\":144,\"byteLength\":6}],"
+      "\"accessors\":["
+      "{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+      "{\"bufferView\":0,\"byteOffset\":12,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+      "{\"bufferView\":0,\"byteOffset\":24,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"},"
+      "{\"bufferView\":0,\"byteOffset\":32,\"componentType\":5123,\"count\":3,\"type\":\"VEC4\"},"
+      "{\"bufferView\":0,\"byteOffset\":40,\"componentType\":5121,\"normalized\":true,"
+      "\"count\":3,\"type\":\"VEC4\"},"
+      "{\"bufferView\":1,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}],"
+      "\"meshes\":[{\"weights\":[0.25],\"primitives\":[{\"attributes\":"
+      "{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"JOINTS_0\":3,\"WEIGHTS_0\":4},"
+      "\"indices\":5,\"targets\":[{\"POSITION\":0}]}]}]}";
+  tg3_model model;
+  tg3_error_stack errors;
+  tg3_parse_options opts;
+  tg3_error_code err;
+  uint32_t i;
+
+  /* TG3_PERMISSIVE: no diagnostics at all, model fields intact. */
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  err = tg3_parse(&model, &errors, (const uint8_t *)json, sizeof(json) - 1, "", 0, &opts);
+  if (err != TG3_OK || tg3_errors_count(&errors) != 0 ||
+      model.meshes_count != 1 || model.meshes[0].primitives_count != 1 ||
+      model.meshes[0].primitives[0].attributes_count != 5 ||
+      model.meshes[0].primitives[0].targets_count != 1 ||
+      model.meshes[0].weights_count != 1 ||
+      model.meshes[0].primitives[0].indices != 5) {
+    fprintf(stderr, "contract valid model: permissive parse changed (err=%d, diags=%u)\n",
+            (int)err, tg3_errors_count(&errors));
+    for (i = 0; i < tg3_errors_count(&errors) && i < 8; ++i)
+      fprintf(stderr, "  %s @ %s\n", tg3_errors_get(&errors, i)->message,
+              tg3_errors_get(&errors, i)->json_path);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+
+  /* TG3_STRICT: accepted, still zero diagnostics. */
+  tg3_error_stack_init(&errors);
+  tg3_parse_options_init(&opts);
+  opts.strictness = TG3_STRICT;
+  err = tg3_parse(&model, &errors, (const uint8_t *)json, sizeof(json) - 1, "", 0, &opts);
+  if (err != TG3_OK || tg3_errors_count(&errors) != 0) {
+    fprintf(stderr, "contract valid model: strict parse rejected (err=%d, diags=%u)\n",
+            (int)err, tg3_errors_count(&errors));
+    for (i = 0; i < tg3_errors_count(&errors) && i < 8; ++i)
+      fprintf(stderr, "  %s @ %s\n", tg3_errors_get(&errors, i)->message,
+              tg3_errors_get(&errors, i)->json_path);
+    tg3_model_free(&model);
+    tg3_error_stack_free(&errors);
+    return 0;
+  }
+  tg3_model_free(&model);
+  tg3_error_stack_free(&errors);
+  return 1;
+}
+
+/* KHR_mesh_quantization only widens the component types of
+ * POSITION/NORMAL/TANGENT/TEXCOORD_n, and only to normalized signed ints. */
+static int check_quantization_contract(void) {
+  static const char with_ext[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"extensionsUsed\":[\"KHR_mesh_quantization\"],"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5122,\"normalized\":true,"
+      "\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  static const char without_ext[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5122,\"normalized\":true,"
+      "\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  static const char unnormalized[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"extensionsUsed\":[\"KHR_mesh_quantization\"],"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5122,"
+      "\"count\":3,\"type\":\"VEC3\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  static const char wrong_shape[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"extensionsUsed\":[\"KHR_mesh_quantization\"],"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":24}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5122,\"normalized\":true,"
+      "\"count\":3,\"type\":\"VEC2\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0}}]}]}";
+  static const char joints_quantized[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"extensionsUsed\":[\"KHR_mesh_quantization\"],"
+      "\"buffers\":[{\"byteLength\":256}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+      "{\"bufferView\":0,\"componentType\":5120,\"normalized\":true,\"count\":3,"
+      "\"type\":\"VEC4\"}],"
+      "\"meshes\":[{\"primitives\":[{\"attributes\":"
+      "{\"POSITION\":0,\"JOINTS_0\":1}}]}]}";
+  tg3_error_code err;
+  /* Quantized POSITION is accepted under STRICT with the extension. */
+  if (contract_diags(with_ext, TG3_STRICT, TG3_SEVERITY_ERROR, &err) != 0 ||
+      err != TG3_OK) {
+    fprintf(stderr, "quantization: normalized SHORT POSITION rejected\n");
+    return 0;
+  }
+  if (contract_diags(without_ext, TG3_STRICT, TG3_SEVERITY_ERROR, &err) < 1 ||
+      err != TG3_ERR_INVALID_VALUE) {
+    fprintf(stderr, "quantization: SHORT POSITION accepted without extension\n");
+    return 0;
+  }
+  if (contract_diags(unnormalized, TG3_STRICT, TG3_SEVERITY_ERROR, &err) < 1 ||
+      err != TG3_ERR_INVALID_VALUE) {
+    fprintf(stderr, "quantization: un-normalized SHORT POSITION accepted\n");
+    return 0;
+  }
+  if (contract_diags(wrong_shape, TG3_STRICT, TG3_SEVERITY_ERROR, &err) < 1 ||
+      err != TG3_ERR_INVALID_VALUE) {
+    fprintf(stderr, "quantization: VEC2 POSITION accepted under the extension\n");
+    return 0;
+  }
+  if (contract_diags(joints_quantized, TG3_STRICT, TG3_SEVERITY_ERROR, &err) < 1 ||
+      err != TG3_ERR_INVALID_VALUE) {
+    fprintf(stderr, "quantization: relaxed JOINTS_n accepted\n");
+    return 0;
+  }
+  return 1;
+}
+
+/* An index accessor with a huge count shared by many primitives must not turn
+ * validation into an unbounded scan: the total-scan budget disables value
+ * scanning while the cheap shape/type rules still run. */
+static int check_index_scan_budget(void) {
+  /* Declared-only buffer (no URI, so no bytes are loaded): the huge index
+   * accessor is in range on paper, so only the scan budget is in play. */
+  static const char json[] =
+      "{\"asset\":{\"version\":\"2.0\"},"
+      "\"buffers\":[{\"byteLength\":400000000}],"
+      "\"bufferViews\":[{\"buffer\":0,\"byteLength\":36},"
+      "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":200000000}],"
+      "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":3,"
+      "\"type\":\"VEC3\"},"
+      "{\"bufferView\":1,\"componentType\":5123,\"count\":100000000,"
+      "\"type\":\"SCALAR\"}],"
+      "\"meshes\":[{\"primitives\":["
+      "{\"attributes\":{\"POSITION\":0},\"indices\":1},"
+      "{\"attributes\":{\"POSITION\":0},\"indices\":1}]}]}";
+  tg3_error_code err;
+  if (contract_diags(json, TG3_PERMISSIVE, TG3_SEVERITY_ERROR, &err) != 0 ||
+      err != TG3_OK) {
+    fprintf(stderr, "index scan budget: permissive parse errored (%d)\n", (int)err);
+    return 0;
+  }
+  return 1;
+}
+
 static int check_material_texture_index_oob_rejected(void) {
   static const char json[] =
       "{\"asset\":{\"version\":\"2.0\"},"
@@ -2029,6 +2386,24 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (!check_strict_accepts_valid_model()) {
+    return 1;
+  }
+  if (!check_attribute_contract()) {
+    return 1;
+  }
+  if (!check_morph_target_contract()) {
+    return 1;
+  }
+  if (!check_index_value_contract()) {
+    return 1;
+  }
+  if (!check_contract_accepts_valid_model()) {
+    return 1;
+  }
+  if (!check_quantization_contract()) {
+    return 1;
+  }
+  if (!check_index_scan_budget()) {
     return 1;
   }
   if (!check_material_texture_index_oob_rejected()) {

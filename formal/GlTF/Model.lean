@@ -60,6 +60,9 @@ structure Buffer where
   byteLength : UInt64 := 0
   /-- `data.count`: number of bytes actually loaded (0 = not loaded). -/
   dataCount : UInt64 := 0
+  /-- The loaded bytes themselves; validation reads index values from here.
+      A C heap respects `data.length = dataCount`. -/
+  data : List UInt8 := []
   deriving Repr, Inhabited
 
 structure BufferView where
@@ -146,6 +149,8 @@ structure Primitive where
 
 structure Mesh where
   primitives : List Primitive := []
+  /-- `mesh.weights`: one default weight per morph target. -/
+  weights : List F64 := []
   deriving Repr, Inhabited
 
 structure Node where
